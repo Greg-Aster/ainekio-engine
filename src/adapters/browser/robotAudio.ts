@@ -24,8 +24,15 @@ export class BrowserRobotAudioAdapter {
 	#micCounter = 0;
 	#micCarry: number[] = [];
 
-	get isMicrophoneActive(): boolean {
+	get micActive(): boolean {
 		return this.#micActive;
+	}
+
+	get micSupported(): boolean {
+		return (
+			typeof navigator !== "undefined" &&
+			Boolean(navigator.mediaDevices?.getUserMedia)
+		);
 	}
 
 	async unlock(): Promise<void> {
@@ -92,7 +99,7 @@ export class BrowserRobotAudioAdapter {
 		this.#nextPlayTime = startAt + buffer.duration;
 	}
 
-	stopPlayback(): void {
+	stopSpeaker(): void {
 		this.#nextPlayTime = 0;
 	}
 
@@ -218,7 +225,7 @@ export class BrowserRobotAudioAdapter {
 
 	dispose(): void {
 		this.stopMicrophone();
-		this.stopPlayback();
+		this.stopSpeaker();
 		if (this.#audioContext) {
 			void this.#audioContext.close().catch(() => {});
 			this.#audioContext = undefined;

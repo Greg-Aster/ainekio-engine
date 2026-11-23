@@ -5,9 +5,17 @@ import type { MultiplayerTransportPort } from "../../../multiplayer/index.js";
 type MessageListener = (message: unknown, peerId?: NetworkPeerId) => void;
 type PeerListListener = (peerIds: readonly NetworkPeerId[]) => void;
 
+const PEER_CONNECT_TIMEOUT_MS = 12000;
+
 export async function createPeerHostTransport(): Promise<MultiplayerTransportPort> {
 	const peer = new Peer();
-	const peerId = await waitForPeerOpen(peer);
+	let peerId: NetworkPeerId;
+	try {
+		peerId = await waitForPeerOpen(peer, PEER_CONNECT_TIMEOUT_MS);
+	} catch (err) {
+		peer.destroy();
+		throw err;
+	}
 	const connections = new Map<NetworkPeerId, DataConnection>();
 	const messageListeners = new Set<MessageListener>();
 	const peerListListeners = new Set<PeerListListener>();
@@ -87,30 +95,42 @@ export async function createPeerClientTransport(
 	hostPeerId: NetworkPeerId,
 ): Promise<MultiplayerTransportPort> {
 	const peer = new Peer();
-	const peerId = await waitForPeerOpen(peer);
+	let peerId: NetworkPeerId;
+	try {
+		peerId = await waitForPeerOpen(peer, PEER_CONNECT_TIMEOUT_MS);
+	} catch (err) {
+		peer.destroy();
+		throw err;
+	}
 	const connection = peer.connect(hostPeerId, { reliable: true });
-	await waitForConnectionOpen(connection);
+	try {
+		await waitForConnectionOpen(connection, PEER_CONNECT_TIMEOUT_MS);
+	} catch (err) {
+		connection.close();
+		peer.destroy();
+		throw err;
+	}
 	const messageListeners = new Set<MessageListener>();
 	const peerListListeners = new Set<PeerListListener>();
 	let connected = true;
+
+	const markClosed = () => {
+		if (!connected) {
+			return;
+		}
+		connected = false;
+		for (const listener of peerListListeners) {
+			listener([]);
+		}
+	};
 
 	connection.on("data", (data: unknown) => {
 		for (const listener of messageListeners) {
 			listener(data, hostPeerId);
 		}
 	});
-	connection.on("close", () => {
-		connected = false;
-		for (const listener of peerListListeners) {
-			listener([]);
-		}
-	});
-	connection.on("error", () => {
-		connected = false;
-		for (const listener of peerListListeners) {
-			listener([]);
-		}
-	});
+	connection.on("close", markClosed);
+	connection.on("error", markClosed);
 
 	return {
 		peerId,
@@ -144,6 +164,7 @@ export async function createPeerClientTransport(
 			return connected ? [hostPeerId] : [];
 		},
 		dispose() {
+			connected = false;
 			connection.close();
 			peer.destroy();
 			messageListeners.clear();
@@ -152,16 +173,44 @@ export async function createPeerClientTransport(
 	};
 }
 
-function waitForPeerOpen(peer: Peer): Promise<NetworkPeerId> {
+function waitForPeerOpen(
+	peer: Peer,
+	timeoutMs: number,
+): Promise<NetworkPeerId> {
 	return new Promise((resolve, reject) => {
-		peer.once("open", (id: string) => resolve(id));
-		peer.once("error", (error: Error) => reject(error));
+		const timer = globalThis.setTimeout(() => {
+			reject(new Error("Timed out connecting to PeerJS signaling server."));
+		}, timeoutMs);
+		peer.once("open", (id: string) => {
+			globalThis.clearTimeout(timer);
+			resolve(id);
+		});
+		peer.once("error", (error: Error) => {
+			globalThis.clearTimeout(timer);
+			reject(error);
+		});
 	});
 }
 
-function waitForConnectionOpen(connection: DataConnection): Promise<void> {
+function waitForConnectionOpen(
+	connection: DataConnection,
+	timeoutMs: number,
+): Promise<void> {
 	return new Promise((resolve, reject) => {
-		connection.once("open", () => resolve());
-		connection.once("error", (error: Error) => reject(error));
+		const timer = globalThis.setTimeout(() => {
+			reject(
+				new Error(
+					"Timed out connecting to room host. The room may have closed.",
+				),
+			);
+		}, timeoutMs);
+		connection.once("open", () => {
+			globalThis.clearTimeout(timer);
+			resolve();
+		});
+		connection.once("error", (error: Error) => {
+			globalThis.clearTimeout(timer);
+			reject(error);
+		});
 	});
 }

@@ -10,6 +10,7 @@ import {
 	type MultiplayerWireMessage,
 	isMultiplayerWireMessage,
 	normalizeRoomName,
+	sanitizeDisplayName,
 } from "./messages.js";
 
 export type MultiplayerTransportPort = {
@@ -35,6 +36,7 @@ export type RoomDirectoryPort = {
 export type MultiplayerSession = {
 	snapshot(): MultiplayerSnapshot;
 	subscribe(listener: (snapshot: MultiplayerSnapshot) => void): () => void;
+	setDisplayName(name: string): void;
 	attachTransport(options: {
 		readonly transport: MultiplayerTransportPort;
 		readonly roomName?: string;
@@ -52,6 +54,7 @@ export type MultiplayerSession = {
 export function createMultiplayerSession(
 	options: {
 		readonly enabled?: boolean;
+		readonly displayName?: string;
 		readonly now?: () => number;
 		readonly timestamp?: () => string;
 	} = {},
@@ -63,11 +66,13 @@ export function createMultiplayerSession(
 	let transport: MultiplayerTransportPort | undefined;
 	let removeMessageListener: (() => void) | undefined;
 	let removePeerListListener: (() => void) | undefined;
+	let hostLocalPlayer: MultiplayerRemotePlayer | undefined;
 	let state: MutableMultiplayerState = {
 		enabled,
 		mode: "idle",
 		status: enabled ? "idle" : "disabled",
 		localPeerId: undefined,
+		displayName: sanitizeDisplayName(options.displayName ?? ""),
 		roomName: undefined,
 		connectedPeers: [],
 		remotePlayers: new Map(),
@@ -86,44 +91,87 @@ export function createMultiplayerSession(
 				listeners.delete(listener);
 			};
 		},
-		attachTransport(options) {
+		setDisplayName(name) {
+			const next = sanitizeDisplayName(name);
+			if (next === state.displayName) {
+				return;
+			}
+			state = {
+				...state,
+				displayName: next,
+			};
+			notify();
+		},
+		attachTransport(attachOptions) {
 			if (!state.enabled) {
-				options.transport.dispose();
+				attachOptions.transport.dispose();
 				return;
 			}
 
 			cleanupTransport();
-			transport = options.transport;
+			transport = attachOptions.transport;
+			hostLocalPlayer = undefined;
 			state = {
 				...state,
 				mode: transport.role,
 				status: "connected",
 				localPeerId: transport.peerId,
-				roomName: options.roomName
-					? normalizeRoomName(options.roomName)
+				roomName: attachOptions.roomName
+					? normalizeRoomName(attachOptions.roomName)
 					: state.roomName,
 				connectedPeers: transport.connectedPeers(),
+				remotePlayers: new Map(),
 				error: undefined,
 			};
 			addLog(
 				transport.role === "host"
-					? `Host peer ready: ${transport.peerId}`
-					: `Connected as peer: ${transport.peerId}`,
+					? `Room "${state.roomName ?? ""}" live (host ${transport.peerId})`
+					: `Joined room "${state.roomName ?? ""}"`,
 				"success",
 			);
 			removeMessageListener = transport.onMessage(handleTransportMessage);
 			removePeerListListener = transport.onPeerListChanged((peerIds) => {
+				const activeTransport = transport;
+				if (!activeTransport) {
+					return;
+				}
+				if (
+					activeTransport.role === "client" &&
+					peerIds.length === 0 &&
+					state.status === "connected"
+				) {
+					cleanupTransport();
+					state = {
+						...state,
+						mode: "idle",
+						status: "disconnected",
+						localPeerId: undefined,
+						connectedPeers: [],
+						remotePlayers: new Map(),
+						error: "Host closed the room or connection was lost.",
+					};
+					addLog("Connection to room host closed.", "warn");
+					notify();
+					return;
+				}
+
+				const pruned = pruneRemotePlayers(state.remotePlayers, peerIds);
 				state = {
 					...state,
 					connectedPeers: [...peerIds],
-					remotePlayers: pruneRemotePlayers(state.remotePlayers, peerIds),
+					remotePlayers: pruned,
 				};
+				if (activeTransport.role === "host" && peerIds.length > 0) {
+					broadcastFullStateFromHost();
+				}
 				notify();
 			});
 			notify();
 		},
 		markConnecting(mode, roomName) {
-			if (!state.enabled) return;
+			if (!state.enabled) {
+				return;
+			}
 			state = {
 				...state,
 				mode,
@@ -133,22 +181,28 @@ export function createMultiplayerSession(
 			};
 			addLog(
 				mode === "host"
-					? "Initializing multiplayer host..."
+					? `Creating room "${state.roomName ?? ""}"...`
 					: `Joining room "${state.roomName ?? ""}"...`,
 			);
 			notify();
 		},
 		setError(message) {
+			cleanupTransport();
 			state = {
 				...state,
+				mode: "idle",
 				status: "error",
+				localPeerId: undefined,
+				connectedPeers: [],
+				remotePlayers: new Map(),
 				error: message,
 			};
 			addLog(message, "error");
 			notify();
 		},
-		disconnect(message = "Disconnected from multiplayer.") {
+		disconnect(message = "Left multiplayer room.") {
 			cleanupTransport();
+			hostLocalPlayer = undefined;
 			state = {
 				...state,
 				mode: "idle",
@@ -156,6 +210,7 @@ export function createMultiplayerSession(
 				localPeerId: undefined,
 				connectedPeers: [],
 				remotePlayers: new Map(),
+				error: undefined,
 			};
 			addLog(message, "warn");
 			notify();
@@ -165,10 +220,29 @@ export function createMultiplayerSession(
 				return;
 			}
 
+			const enrichedPose: MultiplayerPlayerPose = state.displayName
+				? {
+						...pose,
+						displayName: pose.displayName ?? state.displayName,
+					}
+				: pose;
+
+			if (transport.role === "host") {
+				hostLocalPlayer = {
+					peerId: state.localPeerId,
+					pose: enrichedPose,
+					updatedAt: now(),
+				};
+				if (state.connectedPeers.length > 0) {
+					broadcastFullStateFromHost();
+				}
+				return;
+			}
+
 			void transport.send({
 				type: "multiplayer:player-pose",
 				peerId: state.localPeerId,
-				pose,
+				pose: enrichedPose,
 			});
 		},
 		sendChat(text) {
@@ -186,6 +260,7 @@ export function createMultiplayerSession(
 			const message: MultiplayerChatMessage = {
 				id: `${state.localPeerId}:${timestamp()}:${state.chatMessages.length}`,
 				senderId: state.localPeerId,
+				...(state.displayName ? { senderName: state.displayName } : {}),
 				text: trimmedText.slice(0, 200),
 				timestamp: timestamp(),
 			};
@@ -209,6 +284,20 @@ export function createMultiplayerSession(
 		},
 	};
 
+	function broadcastFullStateFromHost(): void {
+		if (!transport || transport.role !== "host") {
+			return;
+		}
+		const players: MultiplayerRemotePlayer[] = [
+			...(hostLocalPlayer ? [hostLocalPlayer] : []),
+			...state.remotePlayers.values(),
+		];
+		void transport.broadcast({
+			type: "multiplayer:full-state",
+			players,
+		});
+	}
+
 	function handleTransportMessage(
 		message: unknown,
 		sourcePeerId?: NetworkPeerId,
@@ -228,7 +317,9 @@ export function createMultiplayerSession(
 		message: MultiplayerWireMessage,
 		sourcePeerId?: NetworkPeerId,
 	): void {
-		if (!transport) return;
+		if (!transport) {
+			return;
+		}
 
 		if (message.type === "multiplayer:player-pose") {
 			const peerId = sourcePeerId ?? message.peerId;
@@ -237,21 +328,24 @@ export function createMultiplayerSession(
 				pose: message.pose,
 				updatedAt: now(),
 			});
-			void transport.broadcast({
-				type: "multiplayer:full-state",
-				players: [...state.remotePlayers.values()],
-			});
+			broadcastFullStateFromHost();
 			notify();
 			return;
 		}
 
 		if (message.type === "multiplayer:chat") {
-			state = {
-				...state,
-				chatMessages: [...state.chatMessages, message.message].slice(-100),
-			};
-			void transport.broadcast(message);
-			notify();
+			if (
+				!state.chatMessages.some(
+					(existing) => existing.id === message.message.id,
+				)
+			) {
+				state = {
+					...state,
+					chatMessages: [...state.chatMessages, message.message].slice(-100),
+				};
+				void transport.broadcast(message);
+				notify();
+			}
 		}
 	}
 
@@ -294,6 +388,7 @@ export function createMultiplayerSession(
 			enabled: state.enabled,
 			mode: state.mode,
 			status: state.status,
+			displayName: state.displayName,
 			connectedPeers: [...state.connectedPeers],
 			remotePlayers: [...state.remotePlayers.values()],
 			chatMessages: [...state.chatMessages],
@@ -350,6 +445,7 @@ type MutableMultiplayerState = {
 	readonly mode: MultiplayerMode;
 	readonly status: MultiplayerConnectionStatus;
 	readonly localPeerId: NetworkPeerId | undefined;
+	readonly displayName: string;
 	readonly roomName: string | undefined;
 	readonly connectedPeers: readonly NetworkPeerId[];
 	readonly remotePlayers: Map<NetworkPeerId, MultiplayerRemotePlayer>;

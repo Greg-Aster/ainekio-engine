@@ -10,8 +10,8 @@ export function createHttpRoomDirectory(options: {
 	readonly baseUrl: string;
 	readonly fetch?: RoomDirectoryFetch;
 }): RoomDirectoryPort {
-	const fetcher = options.fetch ?? globalThis.fetch.bind(globalThis);
 	const baseUrl = options.baseUrl.replace(/\/+$/, "");
+	const fetcher = options.fetch ?? globalThis.fetch.bind(globalThis);
 
 	return {
 		async register(roomName, hostId) {
@@ -26,19 +26,23 @@ export function createHttpRoomDirectory(options: {
 			}
 		},
 		async lookup(roomName) {
-			const response = await fetcher(`${baseUrl}/lookup/${roomName}`);
+			const response = await fetcher(
+				`${baseUrl}/lookup/${encodeURIComponent(roomName)}`,
+			);
 
 			if (!response.ok) {
 				throw new Error(await responseErrorMessage(response));
 			}
 
-			const data = await response.json();
+			const payload = (await response.json()) as {
+				readonly hostId?: NetworkPeerId;
+			};
 
-			if (!isRecord(data) || typeof data.hostId !== "string") {
-				throw new Error("Room lookup returned an invalid host response.");
+			if (!payload.hostId || typeof payload.hostId !== "string") {
+				throw new Error(`Room "${roomName}" did not return a host peer ID.`);
 			}
 
-			return data.hostId as NetworkPeerId;
+			return payload.hostId;
 		},
 	};
 }
@@ -46,11 +50,11 @@ export function createHttpRoomDirectory(options: {
 async function responseErrorMessage(response: Response): Promise<string> {
 	const text = await response.text().catch(() => "");
 
+	if (response.status === 404) {
+		return "Room not found. Check the room name or create a new room.";
+	}
+
 	return text.length > 0
 		? `Room directory request failed (${response.status}): ${text}`
 		: `Room directory request failed (${response.status}).`;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
 }

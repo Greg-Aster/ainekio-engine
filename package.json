@@ -1,6 +1,6 @@
 {
 	"name": "@ainekio/engine",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"description": "Framework-neutral TypeScript ECS 3D game and simulation engine with Three.js, Rapier, PeerJS, and browser adapters.",
 	"license": "MIT",
 	"type": "module",

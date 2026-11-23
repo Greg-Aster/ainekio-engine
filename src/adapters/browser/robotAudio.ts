@@ -1,64 +1,68 @@
 /**
- * Browser Web Audio adapter for the virtual Ainekio V2 robot's ES8311 mic
- * (16 kHz mono 16-bit PCM capture) and NS4150B speaker (16 kHz PCM playback).
+ * Browser Web Audio adapter for 16 kHz mono 16-bit PCM microphone capture
+ * (20 ms / 640-byte frames with RMS & peak telemetry) and 16 kHz PCM playback.
+ *
+ * Uses the hardware default AudioContext sample rate so createMediaStreamSource()
+ * works cleanly across Chrome, Firefox, and Safari, downsampling mic frames to
+ * exact 16 kHz 20 ms chunks.
  */
 
 const DEFAULT_ROBOT_AUDIO_SAMPLE_RATE = 16000;
 const DEFAULT_ROBOT_AUDIO_FRAME_BYTES = 640;
-const SAMPLES_PER_FRAME = DEFAULT_ROBOT_AUDIO_FRAME_BYTES / 2; // 320 samples (20ms @ 16kHz)
+const SAMPLES_PER_FRAME = DEFAULT_ROBOT_AUDIO_FRAME_BYTES / 2;
 
 export class BrowserRobotAudioAdapter {
 	#audioContext: AudioContext | undefined;
 	#gainNode: GainNode | undefined;
 	#nextPlayTime = 0;
 
-	// Microphone capture state
 	#micStream: MediaStream | undefined;
 	#micSource: MediaStreamAudioSourceNode | undefined;
 	#micProcessor: ScriptProcessorNode | undefined;
 	#micSilentSink: GainNode | undefined;
-	#micCarry: number[] = [];
-	#micCounter = 1;
 	#micActive = false;
+	#micCounter = 0;
+	#micCarry: number[] = [];
 
-	get micActive(): boolean {
+	get isMicrophoneActive(): boolean {
 		return this.#micActive;
 	}
 
-	get micSupported(): boolean {
-		return (
-			typeof navigator !== "undefined" &&
-			typeof navigator.mediaDevices?.getUserMedia === "function"
-		);
+	async unlock(): Promise<void> {
+		const ctx = this.#ensureContext();
+		if (ctx && ctx.state === "suspended") {
+			try {
+				await ctx.resume();
+			} catch {
+				// Browser autoplay policies may defer resume until a user gesture.
+			}
+		}
 	}
 
 	#ensureContext(): AudioContext | undefined {
 		if (this.#audioContext) {
-			if (this.#audioContext.state === "suspended") {
-				void this.#audioContext.resume();
-			}
 			return this.#audioContext;
 		}
 		if (typeof AudioContext === "undefined") {
 			return undefined;
 		}
-		// Use the hardware default sample rate so createMediaStreamSource() works on
-		// Firefox/Linux (which rejects mismatched AudioContext vs MediaStream rates).
-		// Speaker buffers at 16 kHz are resampled natively by Web Audio, and mic input
-		// is downsampled cleanly to 16 kHz in startMicrophone().
 		const ctx = new AudioContext();
 		const gain = ctx.createGain();
-		gain.gain.value = 0.8;
+		gain.gain.value = 0.85;
 		gain.connect(ctx.destination);
 		this.#audioContext = ctx;
 		this.#gainNode = gain;
+		this.#nextPlayTime = 0;
 		return ctx;
 	}
 
-	playSpeakerPcm(pcmBytes: Uint8Array, volumePercent: number): void {
+	playSpeakerPcm(pcmBytes: Uint8Array, volumePercent = 80): void {
 		const ctx = this.#ensureContext();
 		if (!ctx || !this.#gainNode || pcmBytes.byteLength < 2) {
 			return;
+		}
+		if (ctx.state === "suspended") {
+			void ctx.resume().catch(() => {});
 		}
 		this.#gainNode.gain.value = Math.max(0, Math.min(1, volumePercent / 100));
 
@@ -83,38 +87,48 @@ export class BrowserRobotAudioAdapter {
 		source.connect(this.#gainNode);
 
 		const now = ctx.currentTime;
-		const startAt = Math.max(now + 0.01, this.#nextPlayTime);
+		const startAt = Math.max(now + 0.015, this.#nextPlayTime);
 		source.start(startAt);
 		this.#nextPlayTime = startAt + buffer.duration;
 	}
 
-	stopSpeaker(): void {
-		if (this.#audioContext) {
-			this.#nextPlayTime = this.#audioContext.currentTime;
-		}
+	stopPlayback(): void {
+		this.#nextPlayTime = 0;
 	}
 
 	async startMicrophone(
-		onFrame: (counter: number, pcm: Uint8Array) => void,
+		onFrame: (
+			counter: number,
+			pcm: Uint8Array,
+			rms: number,
+			peak: number,
+		) => void,
 	): Promise<boolean> {
 		if (this.#micActive) {
 			return true;
 		}
-		if (!this.micSupported) {
+		if (
+			typeof navigator === "undefined" ||
+			!navigator.mediaDevices?.getUserMedia
+		) {
 			return false;
 		}
 		const ctx = this.#ensureContext();
 		if (!ctx) {
 			return false;
 		}
+		await this.unlock();
 
 		const stream = await navigator.mediaDevices.getUserMedia({
 			audio: {
 				channelCount: 1,
 				echoCancellation: true,
 				noiseSuppression: true,
+				autoGainControl: true,
 			},
+			video: false,
 		});
+
 		const source = ctx.createMediaStreamSource(stream);
 		const processor = ctx.createScriptProcessor(1024, 1, 1);
 		const silentSink = ctx.createGain();
@@ -131,15 +145,15 @@ export class BrowserRobotAudioAdapter {
 					this.#micCarry.push(input[i] ?? 0);
 				}
 			} else {
-				const outLen = Math.floor(input.length / ratio);
-				for (let i = 0; i < outLen; i += 1) {
-					const srcPos = i * ratio;
-					const idx0 = Math.min(input.length - 1, Math.floor(srcPos));
-					const idx1 = Math.min(input.length - 1, idx0 + 1);
-					const frac = srcPos - idx0;
-					const s0 = input[idx0] ?? 0;
-					const s1 = input[idx1] ?? s0;
-					this.#micCarry.push(s0 + (s1 - s0) * frac);
+				const outCount = Math.floor(input.length / ratio);
+				for (let i = 0; i < outCount; i += 1) {
+					const srcIdx = i * ratio;
+					const i0 = Math.floor(srcIdx);
+					const i1 = Math.min(input.length - 1, i0 + 1);
+					const frac = srcIdx - i0;
+					this.#micCarry.push(
+						(input[i0] ?? 0) * (1 - frac) + (input[i1] ?? 0) * frac,
+					);
 				}
 			}
 
@@ -147,49 +161,68 @@ export class BrowserRobotAudioAdapter {
 				const frameSamples = this.#micCarry.splice(0, SAMPLES_PER_FRAME);
 				const pcm = new Uint8Array(DEFAULT_ROBOT_AUDIO_FRAME_BYTES);
 				const view = new DataView(pcm.buffer);
+				let sumSq = 0;
+				let peak = 0;
 				for (let i = 0; i < SAMPLES_PER_FRAME; i += 1) {
 					const clamped = Math.max(-1, Math.min(1, frameSamples[i] ?? 0));
+					const absVal = Math.abs(clamped);
+					if (absVal > peak) {
+						peak = absVal;
+					}
+					sumSq += clamped * clamped;
 					view.setInt16(i * 2, Math.round(clamped * 32767), true);
 				}
+				const rms = Math.sqrt(sumSq / SAMPLES_PER_FRAME);
 				const counter = this.#micCounter;
 				this.#micCounter = (this.#micCounter + 1) >>> 0;
-				onFrame(counter, pcm);
+				onFrame(counter, pcm, rms, peak);
 			}
 		};
 
 		source.connect(processor);
 		processor.connect(silentSink);
 		silentSink.connect(ctx.destination);
+
 		this.#micStream = stream;
 		this.#micSource = source;
 		this.#micProcessor = processor;
 		this.#micSilentSink = silentSink;
 		this.#micActive = true;
+		this.#micCarry = [];
 		return true;
 	}
 
 	stopMicrophone(): void {
 		this.#micActive = false;
 		this.#micCarry = [];
-		this.#micProcessor?.disconnect();
-		this.#micSilentSink?.disconnect();
-		this.#micSource?.disconnect();
-		for (const track of this.#micStream?.getTracks() ?? []) {
-			track.stop();
+		if (this.#micProcessor) {
+			this.#micProcessor.onaudioprocess = null;
+			this.#micProcessor.disconnect();
+			this.#micProcessor = undefined;
 		}
-		this.#micProcessor = undefined;
-		this.#micSilentSink = undefined;
-		this.#micSource = undefined;
-		this.#micStream = undefined;
+		if (this.#micSource) {
+			this.#micSource.disconnect();
+			this.#micSource = undefined;
+		}
+		if (this.#micSilentSink) {
+			this.#micSilentSink.disconnect();
+			this.#micSilentSink = undefined;
+		}
+		if (this.#micStream) {
+			for (const track of this.#micStream.getTracks()) {
+				track.stop();
+			}
+			this.#micStream = undefined;
+		}
 	}
 
 	dispose(): void {
 		this.stopMicrophone();
-		this.stopSpeaker();
+		this.stopPlayback();
 		if (this.#audioContext) {
-			void this.#audioContext.close();
+			void this.#audioContext.close().catch(() => {});
 			this.#audioContext = undefined;
+			this.#gainNode = undefined;
 		}
-		this.#gainNode = undefined;
 	}
 }
